@@ -7,6 +7,7 @@ and get an ATS score with concrete suggestions for improvement.
 import json
 import os
 import re
+import time
 from io import BytesIO
 
 import streamlit as st
@@ -19,6 +20,10 @@ from pypdf import PdfReader
 # Config
 # ----------------------------------------------------------------------------
 DEFAULT_MODEL = "gemini-3.8-flash"  # change via the GEMINI_MODEL secret/env var
+FALLBACK_MODELS = "gemini-flash-latest"  # comma-separated; override with GEMINI_FALLBACK_MODELS
+RETRIES_PER_MODEL = 3
+RETRY_DELAY_SECONDS = 2  # doubles after each failed attempt
+TRANSIENT_CODES = {429, 500, 502, 503, 504}
 MAX_RESUME_CHARS = 15000
 MAX_JD_CHARS = 6000
 MIN_RESUME_CHARS = 100
@@ -218,17 +223,57 @@ def get_secret(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 
-def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str = "") -> dict:
+def is_transient_error(exc: Exception) -> bool:
+    """True for temporary Gemini errors (overloaded, rate limited, server hiccup)."""
+    code = getattr(exc, "code", None)
+    if code in TRANSIENT_CODES:
+        return True
+    text = str(exc).upper()
+    return any(k in text for k in ("UNAVAILABLE", "OVERLOADED", "RESOURCE_EXHAUSTED", "DEADLINE_EXCEEDED"))
+
+
+def analyze_resume(
+    api_key: str,
+    model: str,
+    resume_text: str,
+    job_description: str = "",
+    fallback_models: str = FALLBACK_MODELS,
+) -> dict:
+    """Call Gemini, retrying temporary errors and falling back to other models."""
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+    prompt = build_prompt(resume_text, job_description)
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        response_mime_type="application/json",
     )
-    return normalize_result(parse_json_response(response.text))
+
+    models = [model] + [m.strip() for m in fallback_models.split(",") if m.strip()]
+    models = list(dict.fromkeys(models))  # remove duplicates, keep order
+
+    last_error = None
+    for name in models:
+        delay = RETRY_DELAY_SECONDS
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(
+                    model=name, contents=prompt, config=config
+                )
+                return normalize_result(parse_json_response(response.text))
+            except ValueError as exc:  # bad/empty JSON: retry the same model
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+                if not is_transient_error(exc):
+                    if name == models[0]:
+                        raise  # e.g. bad API key: no point trying other models
+                    break  # fallback model not available: try the next one
+            if attempt < RETRIES_PER_MODEL - 1:
+                time.sleep(delay)
+                delay *= 2
+    raise RuntimeError(
+        "Gemini is busy right now. Please wait a minute and try again. "
+        f"(Last error: {last_error})"
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -337,7 +382,13 @@ def main() -> None:
 
         with st.spinner("Analyzing your resume..."):
             try:
-                result = analyze_resume(api_key, model, resume_text, job_description)
+                result = analyze_resume(
+                    api_key,
+                    model,
+                    resume_text,
+                    job_description,
+                    get_secret("GEMINI_FALLBACK_MODELS", FALLBACK_MODELS),
+                )
             except Exception as exc:
                 st.error(f"Analysis failed: {exc}")
                 return
